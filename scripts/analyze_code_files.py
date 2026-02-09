@@ -2,13 +2,18 @@
 """
 Lists the longest and shortest code files in the project, and counts duplicated function names across files. Useful for identifying potential refactoring targets and enforcing code size guidelines.
 Threshold can be set to warn about files longer or shorter than a certain number of lines.
+
+CI mode (--compare-to): Only warns about files that grew past threshold compared to a base ref.
+Use --strict to exit non-zero on violations for CI gating.
 """
 
 import os
 import re
+import sys
+import subprocess
 import argparse
 from pathlib import Path
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict, Set, Optional
 from collections import defaultdict
 
 # File extensions to consider as code files
@@ -155,6 +160,53 @@ def find_duplicate_functions(files: List[Tuple[Path, int]], root_dir: Path) -> D
     return {name: paths for name, paths in function_locations.items() if len(paths) > 1}
 
 
+def get_line_count_at_ref(file_path: Path, root_dir: Path, ref: str) -> Optional[int]:
+    """Get line count of a file at a specific git ref. Returns None if file doesn't exist at ref."""
+    try:
+        relative_path = file_path.relative_to(root_dir)
+        # Use forward slashes for git paths
+        git_path = str(relative_path).replace('\\', '/')
+        result = subprocess.run(
+            ['git', 'show', f'{ref}:{git_path}'],
+            capture_output=True,
+            cwd=root_dir,
+            encoding='utf-8',
+            errors='ignore',
+        )
+        if result.returncode != 0:
+            return None  # File doesn't exist at ref
+        return len(result.stdout.splitlines())
+    except Exception:
+        return None
+
+
+def find_threshold_regressions(
+    files: List[Tuple[Path, int]],
+    root_dir: Path,
+    compare_ref: str,
+    threshold: int,
+) -> List[Tuple[Path, int, Optional[int]]]:
+    """
+    Find files that crossed the threshold compared to a base ref.
+    Returns list of (path, current_lines, base_lines) for files that:
+    - Were under threshold (or didn't exist) at compare_ref
+    - Are now at or over threshold
+    """
+    regressions = []
+    
+    for file_path, current_lines in files:
+        if current_lines < threshold:
+            continue  # Not over threshold now, skip
+        
+        base_lines = get_line_count_at_ref(file_path, root_dir, compare_ref)
+        
+        # Regression if: file is new OR was under threshold before
+        if base_lines is None or base_lines < threshold:
+            regressions.append((file_path, current_lines, base_lines))
+    
+    return regressions
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Analyze code files: list longest/shortest files, find duplicate function names'
@@ -189,10 +241,46 @@ def main():
         default='.',
         help='Directory to scan (default: current directory)'
     )
+    parser.add_argument(
+        '--compare-to',
+        type=str,
+        default=None,
+        help='Git ref to compare against (e.g., origin/main). Only warn about files that grew past threshold.'
+    )
+    parser.add_argument(
+        '--strict',
+        action='store_true',
+        help='Exit with non-zero status if any violations found (for CI)'
+    )
     
     args = parser.parse_args()
     
     root_dir = Path(args.directory).resolve()
+    
+    # CI delta mode: only show regressions
+    if args.compare_to:
+        print(f"\n📂 Scanning: {root_dir}")
+        print(f"🔍 Comparing to: {args.compare_to}\n")
+        
+        files = find_code_files(root_dir)
+        regressions = find_threshold_regressions(files, root_dir, args.compare_to, args.threshold)
+        
+        if regressions:
+            print(f"⚠️  {len(regressions)} file(s) crossed {args.threshold} line threshold:\n")
+            for file_path, current, base in regressions:
+                relative_path = file_path.relative_to(root_dir)
+                if base is None:
+                    print(f"   {relative_path}: {current:,} lines (new file)")
+                else:
+                    print(f"   {relative_path}: {base:,} → {current:,} lines (+{current - base:,})")
+            print()
+            if args.strict:
+                sys.exit(1)
+        else:
+            print(f"✅ No files crossed {args.threshold} line threshold\n")
+        
+        return
+    
     print(f"\n📂 Scanning: {root_dir}\n")
     
     # Find and sort files by line count
@@ -306,6 +394,10 @@ def main():
         print(f"\n✅ No duplicate function names")
     
     print()
+    
+    # Exit with error if --strict and there are violations
+    if args.strict and long_warnings:
+        sys.exit(1)
 
 
 if __name__ == '__main__':
